@@ -1,12 +1,12 @@
-# Core dependencies - Jetson Nano compatible versions
-torch==1.13.1
+# Core dependencies - Updated for available versions
+torch>=2.0.0,<2.6.0
 numpy>=1.21.0,<1.25.0
 requests>=2.28.0,<2.32.0
 python-dotenv>=1.0.0
 
-# NLP and Sentiment Analysis - ARM64 compatible alternatives
-sentence-transformers>=2.2.0,<2.4.0
-torch-audio==0.13.1
+# NLP and Sentiment Analysis - Lightweight alternatives
+# sentence-transformers>=2.2.0,<2.4.0  # Uncomment if Rust compilation works
+vaderSentiment>=3.3.2
 
 # Data processing
 pandas>=1.5.0,<2.1.0

@@ -1,17 +1,30 @@
-# Core dependencies
-torch>=2.0.0
-transformers>=4.30.0
-numpy>=1.24.0
-requests>=2.31.0
+# Core dependencies - Jetson Nano compatible versions
+torch==1.13.1
+numpy>=1.21.0,<1.25.0
+requests>=2.28.0,<2.32.0
 python-dotenv>=1.0.0
 
+# NLP and Sentiment Analysis - ARM64 compatible alternatives
+sentence-transformers>=2.2.0,<2.4.0
+torch-audio==0.13.1
+
 # Data processing
-pandas>=2.0.0
+pandas>=1.5.0,<2.1.0
 feedparser>=6.0.10
 
-# Technical Analysis & AI
-TA-Lib==0.6.4
-scikit-learn>=1.3.0
+# Technical Analysis & AI - older stable versions
+scikit-learn>=1.1.0,<1.4.0
 
-# Telegram Bot
-python-telegram-bot>=20.0
+# Binance API
+python-binance>=1.0.17
+
+# Telegram Bot - compatible version
+python-telegram-bot>=13.15,<21.0
+
+# Additional utilities
+pytz>=2022.1
+cryptography>=3.4.8
+
+# Financial data and sentiment (alternative to transformers)
+yfinance>=0.2.12
+textblob>=0.17.1

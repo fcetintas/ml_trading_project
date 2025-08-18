@@ -301,6 +301,57 @@ class Exchange:
         
         return quantity, True
     
+    def _validate_quantity_for_sell(self, symbol: str, quantity: float) -> float:
+        """
+        Validate and adjust quantity for sell orders to meet LOT_SIZE requirements
+        
+        Args:
+            symbol: Trading symbol
+            quantity: Original quantity
+            
+        Returns:
+            Adjusted quantity that meets LOT_SIZE requirements
+        """
+        if symbol not in self.symbol_info:
+            self.logger.error(f"No symbol info for {symbol}")
+            return 0.0
+        
+        # Find lot size filter
+        filters = self.symbol_info[symbol]['filters']
+        step_size = None
+        min_qty = None
+        
+        for filter_data in filters:
+            if filter_data['filterType'] == 'LOT_SIZE':
+                step_size = float(filter_data['stepSize'])
+                min_qty = float(filter_data['minQty'])
+                break
+        
+        if step_size is None:
+            self.logger.error(f"No lot size filter found for {symbol}")
+            return 0.0
+        
+        # Round down to valid step size
+        if step_size > 0:
+            decimal_places = len(str(step_size).split('.')[-1].rstrip('0'))
+            adjusted_quantity = float(Decimal(str(quantity)).quantize(
+                Decimal(str(step_size)), 
+                rounding=ROUND_DOWN
+            ))
+        else:
+            adjusted_quantity = quantity
+        
+        # Check minimum quantity
+        if min_qty and adjusted_quantity < min_qty:
+            self.logger.warning(f"Adjusted quantity {adjusted_quantity} below minimum {min_qty} for {symbol}")
+            return 0.0
+        
+        # Log adjustment if significant
+        if abs(quantity - adjusted_quantity) > 0.000001:
+            self.logger.debug(f"Quantity adjusted for LOT_SIZE: {quantity} -> {adjusted_quantity}")
+        
+        return adjusted_quantity
+    
     def place_market_buy_order(self, symbol: str, amount_usd: float) -> OrderResult:
         """
         Place a market buy order
@@ -383,12 +434,20 @@ class Exchange:
                     error_message="Failed to get market data"
                 )
             
+            # Validate and adjust quantity for LOT_SIZE filter
+            adjusted_quantity = self._validate_quantity_for_sell(symbol, quantity)
+            if adjusted_quantity <= 0:
+                return OrderResult(
+                    success=False,
+                    error_message=f"Invalid quantity after LOT_SIZE adjustment: {quantity} -> {adjusted_quantity}"
+                )
+            
             # Place order
             params = {
                 'symbol': symbol,
                 'side': 'SELL',
                 'type': 'MARKET',
-                'quantity': quantity
+                'quantity': adjusted_quantity
             }
             
             response = self._make_request('POST', '/api/v3/order', params, signed=True)

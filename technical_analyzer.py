@@ -407,17 +407,30 @@ class TechnicalAnalyzer:
         if indicators.volume_ratio > 1.5:
             reasoning_parts.append("High volume")
         
-        # Calculate final signal
+        # Calculate final signal with more realistic thresholds
         avg_signal = np.mean(signals)
-        if avg_signal >= 1.5:
+        signal_strength = abs(avg_signal - 1)  # Distance from neutral (1)
+        
+        # More realistic thresholds for better signal generation
+        if avg_signal >= 1.3:  # Lowered from 1.5 - more achievable BUY threshold
             action = 'BUY'
-            confidence = min(0.8, (avg_signal - 1) / 1 + 0.5)
-        elif avg_signal <= 0.5:
+            confidence = min(0.8, 0.5 + signal_strength * 0.4)
+        elif avg_signal <= 0.7:  # Raised from 0.5 - more achievable SELL threshold
             action = 'SELL'
-            confidence = min(0.8, (1 - avg_signal) / 1 + 0.5)
+            confidence = min(0.8, 0.5 + signal_strength * 0.4)
         else:
             action = 'HOLD'
-            confidence = 0.4
+            confidence = max(0.3, 0.5 - signal_strength * 0.2)  # Dynamic HOLD confidence
+        
+        # Boost confidence for strong single indicators even if average is mixed
+        strong_signals = [s for s in signals if s == 0 or s == 2]  # Only BUY/SELL signals
+        if len(strong_signals) >= 2:  # At least 2 strong signals in same direction
+            if all(s == 2 for s in strong_signals) and action != 'SELL':
+                action = 'BUY'
+                confidence = min(0.8, confidence + 0.2)
+            elif all(s == 0 for s in strong_signals) and action != 'BUY':
+                action = 'SELL'
+                confidence = min(0.8, confidence + 0.2)
         
         reasoning = "; ".join(reasoning_parts) if reasoning_parts else "Neutral conditions"
         

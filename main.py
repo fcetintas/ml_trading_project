@@ -76,11 +76,108 @@ class CryptoSentimentBot:
         # Trading session
         self.session = TradingSession(start_time=datetime.now())
         
+        # Recent signals tracking for 30-minute cooldown
+        self.recent_signals = {}  # {symbol: {'BUY': timestamp, 'SELL': timestamp}}
+        
         # Signal handling for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         self.logger.info("🤖 Bot initialized and ready")
+    
+    def _evaluate_and_train_ai(self, symbol: str, technical_signal, indicators, market_data_before, delay_minutes=5):
+        """
+        Evaluate trading outcome after a delay and train the AI model
+        
+        Args:
+            symbol: Trading symbol
+            technical_signal: The technical signal that was generated
+            indicators: Technical indicators used for the signal
+            market_data_before: Market data at time of signal
+            delay_minutes: Minutes to wait before evaluation
+        """
+        if not self.technical_analyzer or not hasattr(self.technical_analyzer, 'learn_from_outcome'):
+            return
+        
+        try:
+            import threading
+            import time
+            
+            def delayed_evaluation():
+                # Wait for the specified delay
+                time.sleep(delay_minutes * 60)
+                
+                # Get current market data
+                current_market_data = self.trader.get_market_data(symbol)
+                if not current_market_data:
+                    return
+                
+                # Calculate price change percentage
+                price_change = (current_market_data.price - market_data_before.price) / market_data_before.price * 100
+                
+                # Determine if the technical signal was correct
+                # 0=sell was right, 1=hold was right, 2=buy was right
+                if price_change > 1.0:  # Price went up significantly
+                    correct_action = 2  # BUY was right
+                elif price_change < -1.0:  # Price went down significantly
+                    correct_action = 0  # SELL was right
+                else:  # Price stayed relatively stable
+                    correct_action = 1  # HOLD was right
+                
+                # Extract features used for the prediction
+                features = self.technical_analyzer._extract_ai_features(indicators)
+                
+                # Train the AI model with this outcome
+                self.technical_analyzer.learn_from_outcome(features, correct_action)
+                
+                # Log the learning
+                action_names = {0: 'SELL', 1: 'HOLD', 2: 'BUY'}
+                self.logger.debug(f"🎯 AI Learning: {symbol} - Signal was {technical_signal.action}, "
+                                f"correct was {action_names[correct_action]}, price change: {price_change:+.2f}%")
+            
+            # Start evaluation in background thread
+            thread = threading.Thread(target=delayed_evaluation, daemon=True)
+            thread.start()
+            
+        except Exception as e:
+            self.logger.error(f"Error in AI training evaluation: {e}")
+    
+    def _should_dismiss_signal(self, symbol: str, action: str) -> bool:
+        """
+        Check if signal should be dismissed due to 30-minute cooldown
+        
+        Args:
+            symbol: Trading symbol
+            action: 'BUY' or 'SELL'
+            
+        Returns:
+            True if signal should be dismissed, False otherwise
+        """
+        if symbol not in self.recent_signals:
+            return False
+        
+        if action not in self.recent_signals[symbol]:
+            return False
+        
+        last_signal_time = self.recent_signals[symbol][action]
+        time_since_last = datetime.now() - last_signal_time
+        cooldown_period = timedelta(minutes=30)
+        
+        if time_since_last < cooldown_period:
+            remaining_time = cooldown_period - time_since_last
+            remaining_minutes = remaining_time.total_seconds() / 60
+            self.logger.info(f"  ⏰ {action} signal dismissed - cooldown active for {remaining_minutes:.1f} more minutes")
+            return True
+        
+        return False
+    
+    def _record_signal(self, symbol: str, action: str):
+        """Record a signal execution for cooldown tracking"""
+        if symbol not in self.recent_signals:
+            self.recent_signals[symbol] = {}
+        
+        self.recent_signals[symbol][action] = datetime.now()
+        self.logger.debug(f"Recorded {action} signal for {symbol}")
     
     def _register_command_handlers(self):
         """Register command handlers with the messaging interface"""
@@ -515,18 +612,39 @@ class CryptoSentimentBot:
         if signal.action == 'HOLD':
             return None
         
+        # Check 30-minute cooldown before executing
+        if self._should_dismiss_signal(signal.symbol, signal.action):
+            return None
+        
         try:
             if signal.action == 'BUY':
-                # Check if we already have a position (should be prevented by signal logic)
-                if self.trade_tracker.has_open_position(signal.symbol):
-                    self.logger.warning(f"Cannot buy {signal.symbol}: already have open position")
+                # Check account balance instead of relying on trade tracker for positions
+                base_asset = signal.symbol.replace('USDT', '')
+                current_balance = self.trader.get_asset_balance(base_asset)
+                
+                if current_balance > 0:
+                    self.logger.info(f"Already have {current_balance:.6f} {base_asset}, will still proceed with buy order")
+                    # Continue with buy - we're not preventing multiple buys anymore
+                
+                # Get USDT balance and determine buy amount
+                usdt_balance = self.trader.get_asset_balance('USDT')
+                
+                if usdt_balance <= 0:
+                    self.logger.warning(f"No USDT balance available for buy: {usdt_balance}")
                     return None
                 
+                # Use full balance if less than $30, otherwise use $30
+                if usdt_balance <= self.config.trading.max_trade_amount:
+                    buy_amount = usdt_balance
+                    buy_reason = f"full USDT balance (${usdt_balance:.2f} ≤ ${self.config.trading.max_trade_amount})"
+                else:
+                    buy_amount = self.config.trading.max_trade_amount
+                    buy_reason = f"${self.config.trading.max_trade_amount} (standard amount)"
+                
+                self.logger.info(f"  💰 Buy decision: USDT balance=${usdt_balance:.2f}, using ${buy_amount:.2f} ({buy_reason})")
+                
                 # Check if we can afford the trade
-                can_trade, reason = self.trader.can_trade(
-                    signal.symbol, 
-                    self.config.trading.max_trade_amount
-                )
+                can_trade, reason = self.trader.can_trade(signal.symbol, buy_amount)
                 
                 if not can_trade:
                     self.logger.warning(f"Cannot execute buy for {signal.symbol}: {reason}")
@@ -535,41 +653,69 @@ class CryptoSentimentBot:
                 # Execute buy order
                 result = self.trader.place_market_buy_order(
                     symbol=signal.symbol,
-                    amount_usd=self.config.trading.max_trade_amount
+                    amount_usd=buy_amount
                 )
                 
                 if result.success:
-                    # Record trade in trade tracker
+                    # Record signal for cooldown tracking
+                    self._record_signal(signal.symbol, 'BUY')
+                    
+                    # Record trade in trade tracker with actual amount used
                     trade = self.trade_tracker.add_buy_trade(
                         symbol=signal.symbol,
                         quantity=result.quantity,
                         price=result.price,
-                        amount_usd=self.config.trading.max_trade_amount,
+                        amount_usd=buy_amount,
                         order_id=result.order_id
                     )
                     
                     # Update legacy session for backwards compatibility
                     self.session.positions[signal.symbol] = result.quantity
-                    self.logger.info(f"  ✅ BUY: {result.quantity:.6f} {signal.symbol} at ${result.price:.4f} (${self.config.trading.max_trade_amount})")
+                    self.logger.info(f"  ✅ BUY: {result.quantity:.6f} {signal.symbol} at ${result.price:.4f} (${buy_amount:.2f})")
                 
                 return result
             
             elif signal.action == 'SELL':
-                # Check if we have a position to sell
-                if not self.trade_tracker.has_open_position(signal.symbol):
-                    self.logger.warning(f"No position to sell for {signal.symbol}")
+                # Get account balance for the base asset (ignore trade tracker for quantity decisions)
+                base_asset = signal.symbol.replace('USDT', '')
+                account_balance = self.trader.get_asset_balance(base_asset)
+                
+                if account_balance <= 0:
+                    self.logger.warning(f"No balance available to sell for {signal.symbol}: account balance={account_balance}")
                     return None
                 
-                # Get position from trade tracker
-                position = self.trade_tracker.get_open_positions()[signal.symbol]
+                # Get current market price
+                market_data = self.trader.get_market_data(signal.symbol)
+                if not market_data:
+                    self.logger.warning(f"Failed to get market data for {signal.symbol}")
+                    return None
+                
+                # Calculate dollar value of available balance
+                available_dollar_value = account_balance * market_data.bid_price
+                
+                # Determine sell quantity based on dollar threshold
+                if available_dollar_value <= self.config.trading.max_trade_amount:
+                    # If dollar value is less than or equal to $30, sell all available
+                    sell_quantity = account_balance
+                    sell_reason = f"full balance (${available_dollar_value:.2f} ≤ ${self.config.trading.max_trade_amount})"
+                else:
+                    # If dollar value is more than $30, sell only $30 worth
+                    sell_quantity = self.config.trading.max_trade_amount / market_data.bid_price
+                    sell_reason = f"${self.config.trading.max_trade_amount} worth"
+                
+                self.logger.info(f"  📊 Sell decision: account balance={account_balance:.6f}, value=${available_dollar_value:.2f}")
+                self.logger.info(f"      Using: {sell_quantity:.6f} ({sell_reason})")
                 
                 # Execute sell order
                 result = self.trader.place_market_sell_order(
                     symbol=signal.symbol,
-                    quantity=position.quantity
+                    quantity=sell_quantity
                 )
                 
                 if result.success:
+                    # Record signal for cooldown tracking
+                    self._record_signal(signal.symbol, 'SELL')
+                    
                     # Calculate actual USD amount received
                     amount_usd = result.quantity * result.price
                     
@@ -585,13 +731,8 @@ class CryptoSentimentBot:
                     # Update legacy session for backwards compatibility
                     self.session.positions[signal.symbol] = 0.0
                     
-                    # Calculate and log P&L
-                    entry_value = position.quantity * position.entry_price
-                    exit_value = amount_usd
-                    pnl = exit_value - entry_value
-                    pnl_pct = (pnl / entry_value) * 100 if entry_value > 0 else 0.0
-                    
-                    self.logger.info(f"  ✅ SELL: {result.quantity:.6f} {signal.symbol} at ${result.price:.4f} | P&L: ${pnl:.2f} ({pnl_pct:+.2f}%)")
+                    # Log successful sell (P&L will be calculated by trade tracker)
+                    self.logger.info(f"  ✅ SELL: {result.quantity:.6f} {signal.symbol} at ${result.price:.4f} (${amount_usd:.2f})")
                 
                 return result
             
@@ -632,6 +773,11 @@ class CryptoSentimentBot:
             
             # Get AI analysis
             technical_signal = self.technical_analyzer.analyze_with_ai(indicators)
+            
+            # Start AI training evaluation in background (learn from this signal)
+            current_market_data = self.trader.get_market_data(symbol)
+            if current_market_data:
+                self._evaluate_and_train_ai(symbol, technical_signal, indicators, current_market_data)
             
             # Log technical analysis results
             tech_emoji = "📈" if technical_signal.action == "BUY" else "📉" if technical_signal.action == "SELL" else "📊"
@@ -700,15 +846,15 @@ class CryptoSentimentBot:
             else:
                 reasoning = f"Conflicting signals, technical dominates: {technical_signal.action}"
         
-        # Check position constraints using trade tracker
-        has_open_position = self.trade_tracker.has_open_position(symbol)
+        # Check position constraints using actual account balance
+        base_asset = symbol.replace('USDT', '')
+        account_balance = self.trader.get_asset_balance(base_asset)
         
-        if final_action == 'BUY' and has_open_position:
+        # Allow BUY regardless of current position (can accumulate)
+        # Only check for SELL if we actually have balance to sell
+        if final_action == 'SELL' and account_balance <= 0:
             final_action = 'HOLD'
-            reasoning += " (already holding position)"
-        elif final_action == 'SELL' and not has_open_position:
-            final_action = 'HOLD'
-            reasoning += " (no position to sell)"
+            reasoning += " (no balance to sell)"
         
         return TradingSignal(
             symbol=symbol,
